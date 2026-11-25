@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.dev-data.json
+.netlify/
+deploy/
+.env
+.env.*
+*.pem
+*.key
+fi-credentials.txt
+beta-passwords.json
+*.mp4
+*.zip
+*.txz
+sites/
+.DS_Store

@@ -1,0 +1,9 @@
+# Netlify site settings for the backend site.
+# In Netlify set "Base directory" to apps/backend (the rest is read from here).
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"

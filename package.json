@@ -1,0 +1,9 @@
+{
+  "name": "funintended",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "node scripts/build.mjs backend && node scripts/build.mjs client-admin && node scripts/build.mjs client-employee"
+  }
+}
