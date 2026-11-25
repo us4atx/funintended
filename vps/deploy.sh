@@ -18,7 +18,10 @@ log(){ echo "[deploy $(date -u +%H:%M:%S)] $*"; }
 
 # ---------- 1. backup ----------
 mkdir -p "$BACKUPS"; chmod 700 "$BACKUPS"
-set -a; [ -f "$ENV_FILE" ] && . "$ENV_FILE"; set +a
+# Read only the settings we need (no sourcing, so special characters in passwords can't break it).
+envget(){ [ -f "$ENV_FILE" ] && sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | sed -e 's/^["\x27]//' -e 's/["\x27]$//'; }
+FI_DEV_STORE=$(envget FI_DEV_STORE || true); PORT=$(envget PORT || true)
+SUPABASE_URL=$(envget SUPABASE_URL || true); SUPABASE_SERVICE_ROLE_KEY=$(envget SUPABASE_SERVICE_ROLE_KEY || true)
 backed_up=0
 if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
   out="$BACKUPS/supabase-fi_documents-$STAMP-${SHA:0:7}.json"
