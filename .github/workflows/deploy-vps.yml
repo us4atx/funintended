@@ -1,0 +1,51 @@
+name: Deploy to VPS
+
+# Every push to main redeploys the 5 FunIntended sites on the VPS.
+# The server backs up the database before it swaps anything (see vps/deploy.sh).
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'tools/**']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package release
+        run: |
+          set -e
+          mkdir -p pkg/app pkg/vps
+          for a in backend client-admin client-employee; do cp -r apps/$a/public pkg/app/$a; done
+          cp -r shared pkg/app/shared
+          cp -r apps/backend/api pkg/api
+          cp vps/server.mjs vps/make-sites.sh vps/package.json vps/deploy.sh pkg/vps/
+          tar czf release.tgz -C pkg .
+          ls -la release.tgz
+
+      - name: Set up SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          set -e
+          [ -n "$VPS_SSH_KEY" ] || { echo "::error::Secret VPS_SSH_KEY is not set"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      # One SSH connection only: the server's fail2ban bans rapid reconnects.
+      - name: Back up database and deploy
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          D=/tmp/fi-deploy-${GITHUB_SHA}
+          ssh -i ~/.ssh/deploy -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 root@"$VPS_HOST" \
+            "rm -rf $D && mkdir -p $D && tar xzf - -C $D && bash $D/vps/deploy.sh $D ${GITHUB_SHA}" < release.tgz
