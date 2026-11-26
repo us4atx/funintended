@@ -1,8 +1,10 @@
 #!/bin/bash
 # Runs ON THE VPS (as root), called by .github/workflows/deploy-vps.yml.
 # Usage: deploy.sh <unpacked bundle dir> <commit sha>
-#  1. Backs up the live data (Supabase table fi_documents if the server uses Supabase,
-#     plus the local JSON data file if one exists) to /var/backups/funintended/.
+#  1. Backs up the live data to /var/backups/funintended/: the Supabase table fi_documents
+#     (via its REST API) when SUPABASE_URL is set, a full pg_dump when a self-hosted Supabase
+#     db container is running, and the old JSON data file if one still exists.
+#     Never touches /etc/funintended.env.
 #     The deploy stops if the backup fails.
 #  2. Builds the new release next to the live one, runs make-sites.sh.
 #  3. Swaps it in, restarts the service, checks the API answers.
@@ -31,6 +33,17 @@ if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d,list); print(len(d),"rows")' "$out.tmp"
   mv "$out.tmp" "$out"; gzip -9 "$out"; backed_up=1
 fi
+# Self-hosted Supabase: full pg_dump of its Postgres (all schemas) from the database container.
+for rt in docker podman; do
+  command -v $rt >/dev/null 2>&1 || continue
+  db=$($rt ps --format '{{.Names}}' 2>/dev/null | grep -E '(^|[-_])supabase[-_]db([-_]|$)|^supabase-db' | head -1 || true)
+  [ -n "$db" ] || continue
+  out="$BACKUPS/supabase-pgdump-$STAMP-${SHA:0:7}.sql.gz"
+  log "Full pg_dump of self-hosted Supabase ($rt container $db)"
+  $rt exec "$db" pg_dump -U postgres -d postgres --clean --if-exists | gzip -9 > "$out.tmp"
+  [ "$(gunzip -c "$out.tmp" | head -c 100000 | grep -c 'PostgreSQL database dump')" -ge 1 ] || { log "pg_dump output looks wrong"; exit 1; }
+  mv "$out.tmp" "$out"; backed_up=1; break
+done
 if [ -n "${FI_DEV_STORE:-}" ] && [ -f "$FI_DEV_STORE" ]; then
   out="$BACKUPS/datafile-$STAMP-${SHA:0:7}.json"
   log "Backing up data file $FI_DEV_STORE"
