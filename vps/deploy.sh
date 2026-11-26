@@ -1,0 +1,84 @@
+#!/bin/bash
+# Runs ON THE VPS (as root), called by .github/workflows/deploy-vps.yml.
+# Usage: deploy.sh <unpacked bundle dir> <commit sha>
+#  1. Backs up the live data to /var/backups/funintended/: the Supabase table fi_documents
+#     (via its REST API) when SUPABASE_URL is set, a full pg_dump when a self-hosted Supabase
+#     db container is running, and the old JSON data file if one still exists.
+#     Never touches /etc/funintended.env.
+#     The deploy stops if the backup fails.
+#  2. Builds the new release next to the live one, runs make-sites.sh.
+#  3. Swaps it in, restarts the service, checks the API answers.
+#  4. If the check fails, puts the previous release back and restarts again.
+set -euo pipefail
+SRC=$1; SHA=${2:-unknown}
+APP=/opt/funintended
+ENV_FILE=/etc/funintended.env
+BACKUPS=/var/backups/funintended
+KEEP=60
+STAMP=$(date -u +%Y%m%d-%H%M%S)
+log(){ echo "[deploy $(date -u +%H:%M:%S)] $*"; }
+
+# ---------- 1. backup ----------
+mkdir -p "$BACKUPS"; chmod 700 "$BACKUPS"
+# Read only the settings we need (no sourcing, so special characters in passwords can't break it).
+envget(){ [ -f "$ENV_FILE" ] && sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | sed -e 's/^["\x27]//' -e 's/["\x27]$//'; }
+FI_DEV_STORE=$(envget FI_DEV_STORE || true); PORT=$(envget PORT || true)
+SUPABASE_URL=$(envget SUPABASE_URL || true); SUPABASE_SERVICE_ROLE_KEY=$(envget SUPABASE_SERVICE_ROLE_KEY || true)
+backed_up=0
+if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
+  out="$BACKUPS/supabase-fi_documents-$STAMP-${SHA:0:7}.json"
+  log "Backing up Supabase table fi_documents"
+  curl -fsS --max-time 120 "${SUPABASE_URL%/}/rest/v1/fi_documents?select=*" \
+    -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" -o "$out.tmp"
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d,list); print(len(d),"rows")' "$out.tmp"
+  mv "$out.tmp" "$out"; gzip -9 "$out"; backed_up=1
+fi
+# Self-hosted Supabase: full pg_dump of its Postgres (all schemas) from the database container.
+for rt in docker podman; do
+  command -v $rt >/dev/null 2>&1 || continue
+  db=$($rt ps --format '{{.Names}}' 2>/dev/null | grep -E '(^|[-_])supabase[-_]db([-_]|$)|^supabase-db' | head -1 || true)
+  [ -n "$db" ] || continue
+  out="$BACKUPS/supabase-pgdump-$STAMP-${SHA:0:7}.sql.gz"
+  log "Full pg_dump of self-hosted Supabase ($rt container $db)"
+  $rt exec "$db" pg_dump -U postgres -d postgres --clean --if-exists | gzip -9 > "$out.tmp"
+  [ "$(gunzip -c "$out.tmp" | head -c 100000 | grep -c 'PostgreSQL database dump')" -ge 1 ] || { log "pg_dump output looks wrong"; exit 1; }
+  mv "$out.tmp" "$out"; backed_up=1; break
+done
+if [ -n "${FI_DEV_STORE:-}" ] && [ -f "$FI_DEV_STORE" ]; then
+  out="$BACKUPS/datafile-$STAMP-${SHA:0:7}.json"
+  log "Backing up data file $FI_DEV_STORE"
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$FI_DEV_STORE"
+  cp -p "$FI_DEV_STORE" "$out"; gzip -9 "$out"; backed_up=1
+fi
+[ "$backed_up" = 1 ] || { log "No database found to back up (no Supabase settings, no data file). Stopping."; exit 1; }
+chmod 600 "$BACKUPS"/*.gz
+ls -1t "$BACKUPS"/*.gz | tail -n +$((KEEP + 1)) | xargs -r rm -f
+log "Backups kept: $(ls -1 "$BACKUPS"/*.gz | wc -l) in $BACKUPS"
+
+# ---------- 2. build new release ----------
+NEW=$APP.new
+rm -rf "$NEW"; mkdir -p "$NEW"
+cp -r "$SRC/api" "$SRC/app" "$NEW/"
+cp "$SRC/vps/server.mjs" "$SRC/vps/make-sites.sh" "$SRC/vps/package.json" "$NEW/"
+echo "$SHA" > "$NEW/REVISION"
+(cd "$NEW" && sh make-sites.sh)
+[ -d "$NEW/sites" ] || { log "make-sites.sh produced no sites/"; exit 1; }
+
+# ---------- 3. swap + restart ----------
+rm -rf "$APP.prev"
+[ -d "$APP" ] && mv "$APP" "$APP.prev"
+mv "$NEW" "$APP"
+log "Restarting funintended (revision ${SHA:0:7})"
+systemctl restart funintended
+
+check(){ for i in $(seq 1 15); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: us4-app-funbackend.us4atx.com' http://127.0.0.1:${PORT:-8800}/ || true)
+  [ "$code" = 200 ] && systemctl is-active --quiet funintended && return 0; sleep 2; done; return 1; }
+
+if check; then log "Deploy OK: ${SHA:0:7}"; rm -rf "$SRC"; exit 0; fi
+
+# ---------- 4. roll back ----------
+log "Health check failed. Rolling back."
+journalctl -u funintended -n 30 --no-pager || true
+if [ -d "$APP.prev" ]; then rm -rf "$APP.failed"; mv "$APP" "$APP.failed"; mv "$APP.prev" "$APP"; systemctl restart funintended; check && log "Rolled back to previous release."; fi
+exit 1
