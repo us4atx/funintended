@@ -4,11 +4,15 @@
 //
 // Where the data lives, in order of preference:
 //   1. FI_DEV_STORE=<path>            local JSON file (npm run dev)
-//   2. SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY   Supabase table public.fi_documents (see supabase/schema.sql)
-//   3. otherwise                      Netlify Blobs
+//   2. SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY   Supabase table public.fi_documents (see supabase/schema.sql).
+//      On the VPS this is the self-hosted Supabase; the settings live in /etc/funintended.env.
 import fs from 'node:fs/promises';
 
-const mode = () => (process.env.FI_DEV_STORE ? 'file' : process.env.SUPABASE_URL ? 'supabase' : 'blobs');
+const mode = () => {
+  if (process.env.FI_DEV_STORE) return 'file';
+  if (process.env.SUPABASE_URL) return 'supabase';
+  throw new Error('No data store configured: set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY (or FI_DEV_STORE for a local file)');
+};
 
 // ---------- local file ----------
 async function readFileDb(file) {
@@ -24,7 +28,7 @@ async function writeFileDb(mutate) {
 // ---------- Supabase (REST API, no extra packages) ----------
 async function sb(path, opts = {}) {
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!key) throw new Error('SUPABASE_SERVICE_ROLE_KEY is not set on the backend site');
+  if (!key) throw new Error('SUPABASE_SERVICE_ROLE_KEY is not set on the backend server');
   const res = await fetch(`${process.env.SUPABASE_URL.replace(/\/$/, '')}/rest/v1/fi_documents${path}`, {
     ...opts,
     headers: { apikey: key, authorization: `Bearer ${key}`, 'content-type': 'application/json', ...(opts.headers || {}) },
@@ -32,16 +36,6 @@ async function sb(path, opts = {}) {
   if (!res.ok) throw new Error(`Supabase ${res.status}: ${(await res.text()).slice(0, 300)}`);
   const text = await res.text();
   return text ? JSON.parse(text) : null;
-}
-
-// ---------- Netlify Blobs ----------
-let blobStore = null;
-async function netlifyStore() {
-  if (!blobStore) {
-    const { getStore } = await import('@netlify/blobs');
-    blobStore = getStore({ name: 'funintended', consistency: 'strong' });
-  }
-  return blobStore;
 }
 
 // ---------- public API ----------
@@ -52,7 +46,6 @@ export async function getDoc(key) {
     const rows = await sb(`?key=eq.${encodeURIComponent(key)}&select=data`);
     return rows?.[0]?.data ?? null;
   }
-  return (await (await netlifyStore()).get(key, { type: 'json' })) ?? null;
 }
 
 export async function setDoc(key, value) {
@@ -66,12 +59,10 @@ export async function setDoc(key, value) {
     });
     return;
   }
-  await (await netlifyStore()).setJSON(key, value);
 }
 
 export async function deleteDoc(key) {
   const m = mode();
   if (m === 'file') return writeFileDb((db) => { delete db[key]; });
-  if (m === 'supabase') { await sb(`?key=eq.${encodeURIComponent(key)}`, { method: 'DELETE' }); return; }
-  await (await netlifyStore()).delete(key);
+  if (m === 'supabase') await sb(`?key=eq.${encodeURIComponent(key)}`, { method: 'DELETE' });
 }

@@ -1,0 +1,9 @@
+[Unit]
+Description=FunIntended: watch for hosting requests from the backend
+
+[Path]
+PathModified=/var/lib/funintended/provision/requests
+Unit=funintended-provision.service
+
+[Install]
+WantedBy=multi-user.target

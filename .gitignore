@@ -1,7 +1,6 @@
 node_modules/
 dist/
 .dev-data.json
-.netlify/
 deploy/
 .env
 .env.*

@@ -1,22 +1,23 @@
 # FunIntended
 
 Employee rewards, recognition, games, learning and mentorship platform.
-One repository, three site types, five Netlify deployments.
+One repository, three site types, all hosted on our own VPS (Ubuntu, 162.35.50.245) under us4atx.com.
 
-| Site | Folder | Netlify site | `FI_CLIENT_ID` |
+| Site | Folder | Address | Client ID |
 |---|---|---|---|
-| Backend / Administration panel + central API | `apps/backend` | fibackend.netlify.app | (none) |
-| Demo client: Management site | `apps/client-admin` | fidemoadmin.netlify.app | `demo` |
-| Demo client: Employee site | `apps/client-employee` | fidemoemployee.netlify.app | `demo` |
-| Beta client 1: Management site | `apps/client-admin` | fibetaadmin1.netlify.app | `beta1` |
-| Beta client 1: Employee site | `apps/client-employee` | fiemployeebeta1.netlify.app | `beta1` |
+| Backend / Administration panel + central API | `apps/backend` | us4-app-funbackend.us4atx.com | (none) |
+| Demo client: Management site | `apps/client-admin` | us4-site-fun-demo1m.us4atx.com | `demo` |
+| Demo client: Employee site | `apps/client-employee` | us4-site-fun-demo1e.us4atx.com | `demo` |
+| Beta client 1: Management site | `apps/client-admin` | us4-site-fun-beta1m.us4atx.com | `beta1` |
+| Beta client 1: Employee site | `apps/client-employee` | us4-site-fun-beta1e.us4atx.com | `beta1` |
+| Any new client | `apps/client-admin` / `apps/client-employee` | us4-site-fun-&lt;id&gt;m / &lt;id&gt;e.us4atx.com | `<id>` |
 
 ## How it fits together
 
 ```
            ┌──────────────────────────────┐
-           │  fibackend.netlify.app       │
-           │  Admin panel  +  /api/*      │──► Supabase (all data)
+           │  us4-app-funbackend.us4atx.com│
+           │  Admin panel  +  /api/*      │──► self-hosted Supabase (all data)
            └──────────────▲───────────────┘
                           │ HTTPS (token auth)
      ┌────────────────────┼─────────────────────┐
@@ -28,8 +29,7 @@ One repository, three site types, five Netlify deployments.
 * **Everything is managed centrally.** All clients, users, features, page text and catalogs live in the backend's
   data store. Client sites hold no data of their own; they read their `FI_CLIENT_ID` and call the backend API.
 * **Provisioning a client** (Admin panel → Clients → New Client) creates the client record, its first admin user,
-  turns on the chosen modules, and prints the exact Netlify settings for its two sites. If you add the optional
-  Netlify settings below, it can also create both Netlify sites for you.
+  turns on the chosen modules, and sets up its two sites on the VPS automatically (see "Hosting" below).
 * **Feature switches** (per client) live in the Admin panel → Clients → *client* → Features. Turning a module off hides
   it on both of that client's sites.
 * **Page content**: default headings and button labels for every employee page are edited in Admin panel → Page Content.
@@ -61,50 +61,35 @@ npm run dev
 Add `?client=beta1` (or any client id) to switch which client a local site points at.
 Local data is saved in `.dev-data.json`; delete it to start fresh.
 
-## Deploy to Netlify
+## Hosting (our VPS)
 
-### 1. Set up Supabase (the database)
+Everything runs on one Ubuntu VPS (162.35.50.245, tracked in US4 Site Admin → Infrastructure):
 
-1. Create a Supabase project.
-2. In the Supabase dashboard open **SQL Editor**, paste `supabase/schema.sql` and click **Run**.
-3. Optional: run `supabase/seed.sql` the same way. (You can skip it: the backend creates the same starting data
-   by itself the first time it runs against an empty table.)
-4. From **Project Settings → API**, copy the **Project URL** and the **service_role** key. The service role key is
-   secret: it goes only on the backend Netlify site, never in a client site or the browser.
+* **OpenPanel's Caddy** owns ports 80/443, terminates HTTPS (Let's Encrypt) and proxies to FunIntended.
+* **FunIntended** is one Node process (`vps/server.mjs`, systemd unit `funintended`, 127.0.0.1:8800) that serves the
+  API and every site, routing by hostname. Code lives in `/opt/funintended`, settings in `/etc/funintended.env`
+  (never overwritten by a deploy).
+* **Data** is in the self-hosted Supabase on the same server (table `fi_documents`, schema in `supabase/schema.sql`).
 
-### 2. Create the five Netlify sites
+### New clients get hosting automatically
 
-Netlify Functions (the API) deploy from a Git repository or the Netlify CLI, not drag-and-drop, so push this folder to
-GitHub first. Then create five sites from that one repository:
+1. Admin panel → Clients → New Client. The client gets `https://us4-site-fun-<id>m.us4atx.com` (Management) and
+   `https://us4-site-fun-<id>e.us4atx.com` (Employee). The FunIntended server serves them as soon as the client exists.
+2. The backend drops a request into `/var/lib/funintended/provision/requests/`. The **provisioning agent**
+   (`vps/provisioner/`, runs as root via systemd) checks DNS points at the VPS, writes a Caddy site block to
+   `/etc/openpanel/caddy/domains/zz-fi-client-<id>.conf`, validates and reloads Caddy (rolling back if Caddy refuses),
+   checks HTTPS, and writes the result to `/var/lib/funintended/provision/status/`. The client page shows that status.
+3. Deleting a client removes its Caddy block the same way.
 
-1. **Backend** — New site from Git → Base directory `apps/backend`. Build command and publish folder are read from
-   `apps/backend/netlify.toml`. Set environment variables:
-   * `SUPABASE_URL` — your Supabase Project URL. **Required.**
-   * `SUPABASE_SERVICE_ROLE_KEY` — your Supabase service_role key. **Required.**
-   * `FI_SECRET` — a long random string (signs sign-in tokens). **Required.**
-   * `FI_ADMIN_EMAIL`, `FI_ADMIN_PASSWORD` — your first platform admin, created on first start
-     (only if you did not run seed.sql; otherwise sign in as `admin@funintended.app` / `changeme` and change it).
-   * Rename the site to `fibackend`.
-2. **Each client site** — New site from Git → Base directory `apps/client-admin` or `apps/client-employee`. Set:
-   * `FI_API_BASE` = `https://fibackend.netlify.app/api`
-   * `FI_CLIENT_ID` = `demo` or `beta1` (see table above)
-   * Rename the site to match the table.
+The agent only ever manages `us4-site-fun-*.us4atx.com` hostnames and its own `zz-fi-client-*.conf` files; it never
+touches `/etc/funintended.env`, OpenPanel's own files, or the original sites' config.
 
-The `demo` (Acme Corp, full sample data) and `beta1` (empty, admin `admin@beta1.client` / `demo1234`) clients are
-created automatically the first time the backend starts. **Change the beta admin password** from the Admin panel
-before you hand it to a tester.
+**DNS:** add one wildcard record `*.us4atx.com  A  162.35.50.245` so every new client's address resolves without a
+manual step. (Records that already exist for other names keep working; a wildcard only answers for names that have no
+record of their own.) Without it the client shows "Waiting for DNS" until the two A records are added.
 
-### Optional: one-click client sites
-
-Set these on the backend site and the "Create on Netlify" button / checkbox will create both client sites for you:
-
-* `NETLIFY_AUTH_TOKEN` — Netlify personal access token
-* `NETLIFY_ACCOUNT_SLUG` — your Netlify team slug
-* `FI_GITHUB_REPO` — e.g. `your-org/funintended`
-* `FI_GITHUB_INSTALLATION_ID` — the Netlify GitHub app installation id for that repo
-* `FI_GITHUB_BRANCH` — optional, default `main`
-
-This path is written against Netlify's public API but has not been run against a live account yet.
+**One-time install of the agent** (on the VPS, as root): `sh vps/provisioner/install.sh`. Optional backend settings
+(defaults match the live server): `FI_HOSTING_DOMAIN`, `FI_SITE_PREFIX`, `FI_BACKEND_HOST`, `FI_VPS_IP`, `FI_PROVISION_DIR`.
 
 ## Project layout
 
@@ -113,16 +98,18 @@ apps/
   backend/
     api/core.mjs          the whole API: auth, platform, clients, client data
     api/seed.mjs          default modules, features, page text, catalogs, demo data
-    api/store.mjs         Supabase (prod) / JSON file (local) / Netlify Blobs (fallback)
-    api/netlify.mjs       optional Netlify site provisioning
-    netlify/functions/api.mjs   Netlify Function entry, served at /api/*
+    api/store.mjs         Supabase (VPS) / JSON file (local)
+    api/hosting.mjs       client site addresses + hosting requests to the VPS provisioning agent
     public/app.js         Admin panel UI
   client-admin/public/app.js     Client Management UI
   client-employee/public/app.js  Employee UI (Dashboard + 4 modules)
 shared/fi.css, shared/fi.js      design system + UI helpers used by all sites
-scripts/build.mjs                builds one site into apps/<site>/dist and writes config.js
+scripts/build.mjs                builds one site into apps/<site>/dist and writes config.js (used by dev)
 scripts/dev.mjs                  local server for all three sites + API
-supabase/schema.sql              the database table (run once in Supabase)
+vps/server.mjs                   the production server on the VPS (API + all sites)
+vps/make-sites.sh                builds the original five sites' folders
+vps/provisioner/                 hosting agent for new clients (+ systemd units, install.sh)
+supabase/schema.sql              the database table
 supabase/seed.sql                optional starting data
 ```
 
