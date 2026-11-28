@@ -35,6 +35,7 @@ const NAV = [
   { section: 'Platform' },
   { href: '#/features', label: 'Features', icon: 'shield', id: 'features' },
   { href: '#/admins', label: 'Admin Users', icon: 'key', id: 'admins' },
+  { href: '#/releases', label: 'Releases', icon: 'rocket', id: 'releases' },
   { href: '#/deploy', label: 'Hosting', icon: 'globe', id: 'deploy' },
 ];
 
@@ -48,7 +49,7 @@ async function render() {
     chip: 'Platform Admin', user: me, content: '<div class="empty">Loading…</div>' });
   const content = document.getElementById('fi-content');
   try {
-    const views = { '': overview, clients: b ? () => clientDetail(b, c || 'overview') : clients, content: contentPage, catalog: () => catalogPage(b), features: featuresPage, admins: adminsPage, deploy: deployPage };
+    const views = { '': overview, clients: b ? () => clientDetail(b, c || 'overview') : clients, content: contentPage, catalog: () => catalogPage(b), features: featuresPage, admins: adminsPage, deploy: deployPage, releases: releasesPage };
     content.innerHTML = await (views[a] || overview)();
   } catch (e) { content.innerHTML = `<div class="card">${empty('⚠️', e.message)}</div>`; }
 }
@@ -250,6 +251,51 @@ async function adminsPage() {
   <td class="row"><button class="btn sm" data-act="admin-edit" data-id="${a.id}">Edit</button>${a.id !== me.id ? `<button class="btn sm danger" data-act="admin-del" data-id="${a.id}">Remove</button>` : ''}</td></tr>`).join('')}</tbody></table></div></section>`;
 }
 
+// ---------- Releases ----------
+const KIND_LABEL = { admin: 'Management', employee: 'Employee' };
+async function releasesPage() {
+  const r = await api('/platform/releases');
+  const ro = r.rollout;
+  const active = ro && ['running', 'paused'].includes(ro.status);
+  const behind = r.sites.filter((s) => s.version !== r.latest).length;
+  const opts = (sel) => r.releases.map((x) => `<option value="${esc(x.id)}" ${x.id === sel ? 'selected' : ''}>${esc(x.id)}</option>`).join('');
+  const rolloutCard = active ? `<section class="card mb"><div class="card-head"><h3>Rolling out ${esc(ro.target)} <span class="pill ${ro.status === 'running' ? 'green' : 'yellow'}">${esc(ro.status)}</span></h3>
+      <div class="row">${ro.status === 'running' ? `<button class="btn primary" data-act="ro-next">Update next site</button><button class="btn" data-act="ro-auto">Update all remaining, one by one</button><button class="btn" data-act="ro-pause">Pause</button>` : `<button class="btn primary" data-act="ro-resume">Resume</button>`}<button class="btn danger" data-act="ro-cancel">Cancel</button></div></div>
+      <p class="ink2">${ro.done.length} done · ${ro.queue.length} to go. Each site is switched, checked, and switched back automatically if the check fails.</p>
+      ${ro.queue[0] ? `<p class="mt">Next: <b>${esc(ro.queue[0].clientId)}</b> · ${KIND_LABEL[ro.queue[0].kind]} site</p>` : ''}</section>`
+    : r.latest ? `<section class="card mb"><div class="card-head"><h3>Latest release: ${esc(r.latest)}</h3>${behind ? `<button class="btn primary" data-act="ro-start" data-version="${esc(r.latest)}">Roll out ${esc(r.latest)} to ${behind} site${behind === 1 ? '' : 's'}</button>` : '<span class="pill green">All sites up to date</span>'}</div>
+      <p class="ink2">${esc(r.releases[0]?.notes || '')}</p></section>`
+    : `<section class="card mb"><p class="ink2">No releases on this server yet. The VPS stores one automatically each time a new version is deployed.</p></section>`;
+  return `${hero({ title: 'Releases', subtitle: `Roll each new version out to the Management and Employee sites one at a time. Backend + API: ${esc(r.backendVersion)}.` })}
+  ${rolloutCard}
+  <div class="fi-grid">
+  <section class="card panel"><h3>Sites</h3><div class="card inner table-wrap mt"><table class="table"><thead><tr><th>Client</th><th>Site</th><th>Release</th><th></th></tr></thead><tbody>
+  ${r.sites.map((s) => `<tr><td><b>${esc(s.clientName)}</b><div class="muted mono" style="background:none;padding:0">${esc(s.clientId)}</div></td><td>${s.url ? siteLink(s.url, KIND_LABEL[s.kind]) : KIND_LABEL[s.kind]}</td>
+    <td><span class="pill ${s.version === r.latest ? 'green' : 'yellow'}">${esc(s.version || 'current')}</span></td>
+    <td>${r.releases.length ? `<select class="sm" data-site-version data-client="${esc(s.clientId)}" data-kind="${s.kind}">${opts(s.version)}</select>` : ''}</td></tr>`).join('')}
+  </tbody></table></div></section>
+  <section class="card"><h3>Release history</h3><div class="list mt">${r.releases.map((x) => `<div class="item"><div class="grow"><b>${esc(x.id)}</b> <span class="muted" style="font-size:12px">${fmtDate(x.createdAt, { year: 'numeric', month: 'short', day: 'numeric' })}${x.sha ? ` · ${esc(x.sha.slice(0, 7))}` : ''}</span><div class="muted" style="font-size:13px">${esc(x.notes || '')}</div></div></div>`).join('') || empty('🚀', 'No releases yet')}</div>
+  <h3 class="mt2">Activity</h3><div class="list mt">${r.log.map((x) => `<div class="item"><div class="grow"><b>${esc(x.action)}</b> <span class="muted">${esc(x.detail || '')}</span><div class="muted" style="font-size:12px">${timeAgo(x.at)}</div></div></div>`).join('') || empty('🗒️', 'Nothing yet')}</div></section></div>`;
+}
+let autoRollout = false;
+async function rolloutAuto() {
+  autoRollout = true; toast('Updating sites one by one. Stay on this page; press Pause to stop.');
+  while (autoRollout) {
+    const r = await api('/platform/releases/next', { method: 'POST' });
+    const last = r.rollout?.done?.[r.rollout.done.length - 1];
+    if (last?.rolledBack) { toast(`${last.clientId} ${KIND_LABEL[last.kind]} site failed its check and was rolled back. Rollout paused.`, true); break; }
+    if (r.rollout?.status !== 'running') break;
+    await rerender(); await new Promise((ok) => setTimeout(ok, 3000));
+  }
+  autoRollout = false; rerender();
+}
+root.addEventListener('change', async (e) => {
+  const sel = e.target.closest('[data-site-version]');
+  if (!sel) return;
+  try { await api('/platform/releases/site', { method: 'POST', body: { clientId: sel.dataset.client, kind: sel.dataset.kind, version: sel.value } }); toast(`${sel.dataset.client} ${KIND_LABEL[sel.dataset.kind]} site now on ${sel.value}`); rerender(); }
+  catch (err) { toast(err.message, true); rerender(); }
+});
+
 // ---------- Hosting ----------
 async function deployPage() {
   const h = (await api('/health')).hosting || {};
@@ -278,6 +324,10 @@ root.addEventListener('click', async (e) => {
   const { act, id, kind } = el.dataset;
   try {
     if (act === 'new-client') return provisionModal();
+    if (act === 'ro-start') { await api('/platform/releases/rollout', { method: 'POST', body: { version: el.dataset.version } }); toast('Rollout planned. Update the sites one at a time.'); return rerender(); }
+    if (act === 'ro-next') { el.disabled = true; const r = await api('/platform/releases/next', { method: 'POST' }); const last = r.rollout?.done?.at(-1); toast(last?.rolledBack ? `Check failed: ${last.check}. Rolled back and paused.` : `${last?.clientId} ${KIND_LABEL[last?.kind] || ''} site updated`, !!last?.rolledBack); return rerender(); }
+    if (act === 'ro-auto') return rolloutAuto();
+    if (['ro-pause', 'ro-resume', 'ro-cancel'].includes(act)) { autoRollout = false; await api(`/platform/releases/${act.slice(3)}`, { method: 'POST' }); return rerender(); }
     if (act === 'edit-sites') {
       const c = await api(`/clients/${id}`);
       return modal({ title: 'Site URLs', body: field('Management site URL', input('adminUrl', c.sites.adminUrl)) + field('Employee site URL', input('employeeUrl', c.sites.employeeUrl)), onSubmit: async (v) => { await api(`/clients/${id}`, { method: 'PUT', body: { sites: v } }); toast('Saved'); rerender(); } });

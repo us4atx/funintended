@@ -91,6 +91,22 @@ record of their own.) Without it the client shows "Waiting for DNS" until the tw
 **One-time install of the agent** (on the VPS, as root): `sh vps/provisioner/install.sh`. Optional backend settings
 (defaults match the live server): `FI_HOSTING_DOMAIN`, `FI_SITE_PREFIX`, `FI_BACKEND_HOST`, `FI_VPS_IP`, `FI_PROVISION_DIR`.
 
+## Versions and rollout
+
+* The version lives in `apps/backend/api/version.mjs` (with a line in `CHANGELOG.md`). Bump it with every change to
+  the client sites.
+* When the VPS starts a deploy with a new version, `vps/server.mjs` stores a copy of the Management and Employee
+  sites in `/var/lib/funintended/releases/<version>/`. Older releases stay there.
+* Every client site is pinned to a release, and a new deploy does not change any site by itself. New clients start
+  on the latest release.
+* **Admin panel → Releases** shows each site's release. "Roll out" plans the update (demo clients first, then beta,
+  then everyone else; Management before Employee). "Update next site" switches one site at a time and checks it is
+  serving the new version. If the check fails, that site goes back to its old release and the rollout pauses.
+  You can also step through every remaining site with a short pause between each, pause or cancel, or put any one
+  site on any release (rollback).
+* The backend panel and the API always run the newest code, so API changes must keep working for releases that are
+  still in use.
+
 ## Project layout
 
 ```
@@ -100,6 +116,8 @@ apps/
     api/seed.mjs          default modules, features, page text, catalogs, demo data
     api/store.mjs         Supabase (VPS) / JSON file (local)
     api/hosting.mjs       client site addresses + hosting requests to the VPS provisioning agent
+    api/releases.mjs      versioned client-site releases (stored per version on the VPS)
+    api/version.mjs       the current version number
     public/app.js         Admin panel UI
   client-admin/public/app.js     Client Management UI
   client-employee/public/app.js  Employee UI (Dashboard + 4 modules)

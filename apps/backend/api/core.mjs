@@ -6,6 +6,8 @@
 import crypto from 'node:crypto';
 import { getDoc, setDoc, deleteDoc } from './store.mjs';
 import { platformSeed, newClientDoc, demoData, MODULES, SUB_FEATURES } from './seed.mjs';
+import { listReleases, releaseAppDir } from './releases.mjs';
+import { VERSION } from './version.mjs';
 import { provisionHosting, removeHosting, hostingStatus, hostingInfo, defaultSites, migrateLegacySites, apiBase } from './hosting.mjs';
 
 const SECRET = () => process.env.FI_SECRET || 'dev-secret-change-me';
@@ -83,7 +85,7 @@ async function loadPlatform() {
   if (p.clients.some((c) => migrateLegacySites(c))) await setDoc('platform', p);
   return p;
 }
-const indexEntry = (c) => ({ id: c.id, name: c.name, status: c.status, plan: c.plan, createdAt: c.createdAt, sites: c.sites });
+const indexEntry = (c) => ({ id: c.id, name: c.name, status: c.status, plan: c.plan, createdAt: c.createdAt, sites: c.sites, versions: c.versions || {} });
 
 async function loadClient(id) {
   const c = await getDoc(`client/${id}`);
@@ -99,9 +101,10 @@ export async function resolveSiteHost(host) {
     const p = await loadPlatform();
     const map = new Map();
     const h = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ''; } };
+    await syncReleases(p);
     for (const c of p.clients) {
-      if (c.sites?.adminUrl) map.set(h(c.sites.adminUrl), { app: 'client-admin', clientId: c.id });
-      if (c.sites?.employeeUrl) map.set(h(c.sites.employeeUrl), { app: 'client-employee', clientId: c.id });
+      if (c.sites?.adminUrl) map.set(h(c.sites.adminUrl), { app: 'client-admin', clientId: c.id, version: c.versions?.admin || null });
+      if (c.sites?.employeeUrl) map.set(h(c.sites.employeeUrl), { app: 'client-employee', clientId: c.id, version: c.versions?.employee || null });
     }
     map.delete('');
     siteCache = { at: Date.now(), map };
@@ -215,6 +218,7 @@ async function platformRoutes({ parts, method, body, session }) {
     }
     return { clients, catalogs: Object.fromEntries(CATALOGS.map((k) => [k, p.catalogs[k].length])), admins: p.admins.length, audit: p.audit.slice(0, 20), hosting: await hostingInfo() };
   }
+  if (section === 'releases') return releaseRoutes(p, { method, body, session, id });
   if (section === 'features') {
     if (method === 'GET') return { modules: MODULES, subFeatures: SUB_FEATURES };
   }
@@ -272,6 +276,8 @@ async function clientRoutes({ parts, method, body, session }) {
     const adminEmail = String(body.adminEmail || `admin@${cid}.client`).toLowerCase();
     doc.users.push({ id: uid('u-'), name: body.adminName || 'Client Admin', email: adminEmail, role: 'client_admin', title: 'Administrator', department: '', points: 0, passwordHash: hashPassword(password), active: true, createdAt: now() });
     if (body.seedDemo) demoData(doc, hashPassword(password));
+    const latest = (await listReleases())[0];
+    if (latest) doc.client.versions = { admin: latest.id, employee: latest.id }; // new clients start on the latest release
     await saveClient(doc);
     p.clients.push(indexEntry(doc.client));
     audit(p, session.userId, 'provision client', cid);
@@ -342,6 +348,121 @@ function siteInfo(cl) {
     admin: { url: cl.sites.adminUrl, app: 'client-admin', config: { apiBase: api, clientId: cl.id } },
     employee: { url: cl.sites.employeeUrl, app: 'client-employee', config: { apiBase: api, clientId: cl.id } },
   };
+}
+
+// ---------- releases + site-by-site rollout (/api/platform/releases/...) ----------
+const KINDS = { admin: 'client-admin', employee: 'client-employee' };
+const KIND_NAME = { admin: 'Management', employee: 'Employee' };
+const siteKey = (s) => `${s.clientId}:${s.kind}`;
+
+// Make sure every client site is pinned to a release. Sites without one (older clients, or the first
+// time releases exist) are pinned to the newest release that was already known, so a freshly deployed
+// version never reaches a site until it is rolled out.
+async function syncReleases(p) {
+  const releases = await listReleases();
+  if (!releases.length) return releases;
+  const known = new Set(p.knownReleases || []);
+  const baseline = releases.find((r) => known.has(r.id)) || releases[releases.length - 1];
+  let changed = false;
+  for (const entry of p.clients) {
+    const v = entry.versions || {};
+    if (v.admin && v.employee) continue;
+    const doc = await getDoc(`client/${entry.id}`);
+    if (!doc) continue;
+    doc.client.versions = { admin: v.admin || baseline.id, employee: v.employee || baseline.id };
+    await setDoc(`client/${entry.id}`, doc);
+    entry.versions = doc.client.versions;
+    changed = true;
+  }
+  const ids = releases.map((r) => r.id);
+  if (ids.some((id) => !known.has(id))) {
+    for (const r of releases.filter((x) => !known.has(x.id))) relLog(p, 'system', `Release ${r.id} available`, r.notes || '');
+    p.knownReleases = ids; changed = true;
+  }
+  if (changed) await setDoc('platform', p);
+  return releases;
+}
+function relLog(p, who, action, detail = '') {
+  p.releaseLog = [{ at: now(), who, action, detail }, ...(p.releaseLog || [])].slice(0, 200);
+}
+function allSites(p) {
+  const rank = (c) => (c.plan === 'demo' ? 0 : c.plan === 'beta' ? 1 : 2); // demo first, then beta, then everyone else
+  return [...p.clients].sort((a, b) => rank(a) - rank(b) || String(a.createdAt).localeCompare(String(b.createdAt)))
+    .flatMap((c) => ['admin', 'employee'].map((kind) => ({ clientId: c.id, clientName: c.name, plan: c.plan, status: c.status, kind,
+      url: kind === 'admin' ? c.sites?.adminUrl : c.sites?.employeeUrl, version: c.versions?.[kind] || null })));
+}
+async function setSiteVersion(p, clientId, kind, version) {
+  const doc = await loadClient(clientId);
+  const from = doc.client.versions?.[kind] || null;
+  doc.client.versions = { ...(doc.client.versions || {}), [kind]: version };
+  await saveClient(doc);
+  Object.assign(p.clients.find((x) => x.id === clientId), indexEntry(doc.client));
+  siteCache.at = 0;
+  return { from, url: kind === 'admin' ? doc.client.sites.adminUrl : doc.client.sites.employeeUrl };
+}
+// After switching a site: does it answer, with the new version? 'ok' | 'unreachable' (could not check) | 'failed: …'
+async function checkSite(url, version) {
+  if (!url) return 'unreachable';
+  try {
+    const r = await fetch(`${url.replace(/\/$/, '')}/config.js?check=${Date.now()}`, { signal: AbortSignal.timeout(8000) });
+    if (r.status >= 500) return `failed: HTTP ${r.status}`;
+    const text = await r.text();
+    return text.includes(`"version":"${version}"`) ? 'ok' : 'failed: the site is not serving the new version';
+  } catch { return 'unreachable'; }
+}
+
+async function releaseRoutes(p, { method, body, session, id: action }) {
+  const releases = await syncReleases(p);
+  const who = session.userId;
+  const state = () => ({ backendVersion: VERSION, releases, latest: releases[0]?.id || null, sites: allSites(p), rollout: p.rollout || null, log: (p.releaseLog || []).slice(0, 30) });
+  if (method === 'GET') return state();
+  if (method !== 'POST') fail(405, 'Method not allowed');
+  const ro = p.rollout;
+
+  if (action === 'rollout') {
+    // Plan a rollout of one release to every site that is not on it yet, one site at a time.
+    const target = body.version || releases[0]?.id;
+    if (!releases.some((r) => r.id === target)) fail(400, `Release ${target} is not on the server`);
+    if (ro && ['running', 'paused'].includes(ro.status)) fail(409, `A rollout of ${ro.target} is already in progress. Cancel it first.`);
+    const queue = allSites(p).filter((s) => s.version !== target && s.status !== 'archived').map(({ clientId, kind }) => ({ clientId, kind }));
+    p.rollout = { target, status: queue.length ? 'running' : 'done', startedAt: now(), startedBy: who, queue, done: [] };
+    relLog(p, who, `Rollout of ${target} started`, `${queue.length} site(s), one at a time`);
+  } else if (action === 'next') {
+    // Move the next site in the queue to the target release, check it, and roll it back if the check fails.
+    if (!ro || ro.status !== 'running') fail(409, 'No rollout is running');
+    const site = ro.queue.shift();
+    if (!site) { ro.status = 'done'; relLog(p, who, `Rollout of ${ro.target} finished`); }
+    else {
+      const app = KINDS[site.kind];
+      if (!(await releaseAppDir(ro.target, app))) fail(500, `Release ${ro.target} is missing on the server`);
+      const { from, url } = await setSiteVersion(p, site.clientId, site.kind, ro.target);
+      const check = await checkSite(url, ro.target);
+      const step = { ...site, from, to: ro.target, at: now(), check };
+      if (check.startsWith('failed')) {
+        if (from) await setSiteVersion(p, site.clientId, site.kind, from);
+        step.rolledBack = true; ro.status = 'paused'; ro.queue.unshift(site);
+        relLog(p, who, `${site.clientId} ${KIND_NAME[site.kind]} site: update to ${ro.target} failed, rolled back to ${from}`, check);
+      } else {
+        relLog(p, who, `${site.clientId} ${KIND_NAME[site.kind]} site → ${ro.target}`, check === 'ok' ? 'checked OK' : 'switched (site could not be reached from the backend to double-check)');
+      }
+      ro.done.push(step);
+      if (!ro.queue.length && ro.status === 'running') { ro.status = 'done'; relLog(p, who, `Rollout of ${ro.target} finished`); }
+    }
+  } else if (action === 'pause' || action === 'resume' || action === 'cancel') {
+    if (!ro || !['running', 'paused'].includes(ro.status)) fail(409, 'No rollout in progress');
+    ro.status = { pause: 'paused', resume: 'running', cancel: 'cancelled' }[action];
+    relLog(p, who, `Rollout of ${ro.target} ${ro.status}`, action === 'cancel' ? 'Sites already updated stay on the new release; roll them back individually if needed.' : '');
+  } else if (action === 'site') {
+    // Put one site on a given release (also used to roll a site back).
+    const { clientId, kind, version } = body;
+    if (!KINDS[kind]) fail(400, 'kind must be admin or employee');
+    if (!(await releaseAppDir(version, KINDS[kind]))) fail(400, `Release ${version} is not on the server`);
+    const { from } = await setSiteVersion(p, clientId, kind, version);
+    if (ro?.queue) ro.queue = ro.queue.filter((s) => siteKey(s) !== siteKey({ clientId, kind }));
+    relLog(p, who, `${clientId} ${KIND_NAME[kind]} site: ${from || 'none'} → ${version}`, 'set by hand');
+  } else fail(404, 'Unknown releases action');
+  await setDoc('platform', p);
+  return state();
 }
 
 async function userRoutes(doc, method, id, body, canManage) {
