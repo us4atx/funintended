@@ -2,11 +2,13 @@
 //   - the Backend/Administration panel (platform admins)
 //   - each client's Management site (client admins and managers)
 //   - each client's Employee site (employees)
-// It runs as a Netlify Function on the backend site and, locally, inside scripts/dev.mjs.
+// On the VPS it runs inside vps/server.mjs (us4-app-funbackend.us4atx.com/api); locally, inside scripts/dev.mjs.
 import crypto from 'node:crypto';
 import { getDoc, setDoc, deleteDoc } from './store.mjs';
 import { platformSeed, newClientDoc, demoData, MODULES, SUB_FEATURES } from './seed.mjs';
-import { provisionNetlifySites, netlifyConfigured } from './netlify.mjs';
+import { listReleases, releaseAppDir } from './releases.mjs';
+import { VERSION } from './version.mjs';
+import { provisionHosting, removeHosting, hostingStatus, hostingInfo, defaultSites, migrateLegacySites, apiBase } from './hosting.mjs';
 
 const SECRET = () => process.env.FI_SECRET || 'dev-secret-change-me';
 const CLIENT_COLLECTIONS = ['users', 'posts', 'orders', 'assignments', 'mentorships', 'sessions', 'results', 'events', 'games', 'courses', 'rewards'];
@@ -65,13 +67,13 @@ async function loadPlatform() {
       passwordHash: hashPassword(process.env.FI_ADMIN_PASSWORD || 'changeme'), createdAt: now(),
     });
     // First run: create the demo client and the first beta client so the
-    // pre-planned Netlify sites have something to connect to.
+    // sites already set up on the VPS have something to connect to.
     const demoPw = hashPassword('demo1234');
     const demo = demoData(newClientDoc({ id: 'demo', name: 'Acme Corp', plan: 'demo',
-      sites: { adminUrl: 'https://fidemoadmin.netlify.app', employeeUrl: 'https://fidemoemployee.netlify.app' } }), demoPw);
+      sites: { adminUrl: 'https://us4-site-fun-demo1m.us4atx.com', employeeUrl: 'https://us4-site-fun-demo1e.us4atx.com' } }), demoPw);
     demo.users.push({ id: 'u-admin', name: 'Acme Admin', email: 'admin@acme.demo', role: 'client_admin', title: 'HR Director', department: 'People', points: 0, passwordHash: demoPw, active: true, createdAt: now() });
     const beta = newClientDoc({ id: 'beta1', name: 'Beta Client 1', plan: 'beta',
-      sites: { adminUrl: 'https://fibetaadmin1.netlify.app', employeeUrl: 'https://fiemployeebeta1.netlify.app' } });
+      sites: { adminUrl: 'https://us4-site-fun-beta1m.us4atx.com', employeeUrl: 'https://us4-site-fun-beta1e.us4atx.com' } });
     beta.users.push({ id: uid('u-'), name: 'Beta Admin', email: 'admin@beta1.client', role: 'client_admin', title: 'Administrator', department: '', points: 0, passwordHash: demoPw, active: true, createdAt: now() });
     for (const c of [demo, beta]) {
       await setDoc(`client/${c.client.id}`, c);
@@ -79,14 +81,35 @@ async function loadPlatform() {
     }
     await setDoc('platform', p);
   }
+  // One-time move of old Netlify site addresses to the VPS ones.
+  if (p.clients.some((c) => migrateLegacySites(c))) await setDoc('platform', p);
   return p;
 }
-const indexEntry = (c) => ({ id: c.id, name: c.name, status: c.status, plan: c.plan, createdAt: c.createdAt, sites: c.sites });
+const indexEntry = (c) => ({ id: c.id, name: c.name, status: c.status, plan: c.plan, createdAt: c.createdAt, sites: c.sites, versions: c.versions || {} });
 
 async function loadClient(id) {
   const c = await getDoc(`client/${id}`);
   if (!c) fail(404, 'Client not found');
+  if (migrateLegacySites(c.client)) await setDoc(`client/${id}`, c);
   return c;
+}
+
+// Which client site a hostname belongs to (used by vps/server.mjs to serve newly provisioned sites).
+let siteCache = { at: 0, map: new Map() };
+export async function resolveSiteHost(host) {
+  if (Date.now() - siteCache.at > 15000) {
+    const p = await loadPlatform();
+    const map = new Map();
+    const h = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ''; } };
+    await syncReleases(p);
+    for (const c of p.clients) {
+      if (c.sites?.adminUrl) map.set(h(c.sites.adminUrl), { app: 'client-admin', clientId: c.id, version: c.versions?.admin || null });
+      if (c.sites?.employeeUrl) map.set(h(c.sites.employeeUrl), { app: 'client-employee', clientId: c.id, version: c.versions?.employee || null });
+    }
+    map.delete('');
+    siteCache = { at: Date.now(), map };
+  }
+  return siteCache.map.get(host) || null;
 }
 const saveClient = (doc) => setDoc(`client/${doc.client.id}`, doc);
 
@@ -118,7 +141,7 @@ export async function handle(req) {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders() });
   try {
     const url = new URL(req.url);
-    const parts = url.pathname.replace(/^\/(\.netlify\/functions\/api|api)\/?/, '').split('/').filter(Boolean);
+    const parts = url.pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean);
     const session = verify((req.headers.get('authorization') || '').replace(/^Bearer /, ''));
     const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await req.json().catch(() => ({})) : {};
     const ctx = { req, url, parts, session, body, method: req.method };
@@ -134,7 +157,7 @@ async function route(ctx) {
   const { parts, method, session, body } = ctx;
   const [a, b, c, d] = parts;
 
-  if (a === 'health') return { ok: true, time: now(), netlifyProvisioning: netlifyConfigured() };
+  if (a === 'health') return { ok: true, time: now(), hosting: await hostingInfo() };
 
   // --- auth ---
   if (a === 'auth' && b === 'login' && method === 'POST') return login(body);
@@ -193,8 +216,9 @@ async function platformRoutes({ parts, method, body, session }) {
       clients.push({ ...entry, users: doc.users.length, posts: doc.posts.length, orders: doc.orders.length,
         pointsAwarded: doc.posts.reduce((s, x) => s + (x.points || 0), 0) });
     }
-    return { clients, catalogs: Object.fromEntries(CATALOGS.map((k) => [k, p.catalogs[k].length])), admins: p.admins.length, audit: p.audit.slice(0, 20), netlifyProvisioning: netlifyConfigured() };
+    return { clients, catalogs: Object.fromEntries(CATALOGS.map((k) => [k, p.catalogs[k].length])), admins: p.admins.length, audit: p.audit.slice(0, 20), hosting: await hostingInfo() };
   }
+  if (section === 'releases') return releaseRoutes(p, { method, body, session, id });
   if (section === 'features') {
     if (method === 'GET') return { modules: MODULES, subFeatures: SUB_FEATURES };
   }
@@ -245,31 +269,40 @@ async function clientRoutes({ parts, method, body, session }) {
     const cid = slugify(body.id || name);
     if (!cid) fail(400, 'Client id is required');
     if (p.clients.some((x) => x.id === cid)) fail(409, `A client with id "${cid}" already exists`);
+    const std = defaultSites(cid);
     const doc = newClientDoc({ id: cid, name, plan: body.plan || 'standard', features: body.features, branding: body.branding,
-      sites: { adminUrl: body.adminUrl || '', employeeUrl: body.employeeUrl || '' } });
+      sites: { adminUrl: body.adminUrl || std.adminUrl, employeeUrl: body.employeeUrl || std.employeeUrl } });
     const password = body.adminPassword || tempPassword();
     const adminEmail = String(body.adminEmail || `admin@${cid}.client`).toLowerCase();
     doc.users.push({ id: uid('u-'), name: body.adminName || 'Client Admin', email: adminEmail, role: 'client_admin', title: 'Administrator', department: '', points: 0, passwordHash: hashPassword(password), active: true, createdAt: now() });
     if (body.seedDemo) demoData(doc, hashPassword(password));
+    const latest = (await listReleases())[0];
+    if (latest) doc.client.versions = { admin: latest.id, employee: latest.id }; // new clients start on the latest release
     await saveClient(doc);
     p.clients.push(indexEntry(doc.client));
     audit(p, session.userId, 'provision client', cid);
     await setDoc('platform', p);
-    let netlify = null;
-    if (body.createNetlifySites) netlify = await provisionNetlifySites(doc.client).catch((e) => ({ error: e.message }));
-    if (netlify?.sites) {
-      doc.client.sites = { ...doc.client.sites, ...netlify.sites };
-      await saveClient(doc);
-      Object.assign(p.clients.find((x) => x.id === cid), indexEntry(doc.client));
-      await setDoc('platform', p);
+    // New clients get their two sites on the VPS automatically (unless turned off in the form).
+    let hosting = null;
+    if (body.autoHosting !== false) {
+      const r = await provisionHosting(doc.client).catch((e) => ({ hosting: { state: 'error', message: e.message } }));
+      hosting = r.hosting;
+      if (r.sites) {
+        doc.client.sites = { ...doc.client.sites, ...r.sites };
+        doc.client.hosting = { provider: 'vps', requestedAt: hosting?.requestedAt || now() };
+        await saveClient(doc);
+        Object.assign(p.clients.find((x) => x.id === cid), indexEntry(doc.client));
+        await setDoc('platform', p);
+        siteCache.at = 0;
+      }
     }
-    return { client: doc.client, credentials: { email: adminEmail, password }, deploy: deployInstructions(doc.client), netlify };
+    return { client: doc.client, credentials: { email: adminEmail, password }, sites: siteInfo(doc.client), hosting };
   }
 
   const doc = await loadClient(id);
 
   if (!sub) {
-    if (method === 'GET') return { ...doc.client, counts: Object.fromEntries(CLIENT_COLLECTIONS.map((k) => [k, (doc[k] || []).length])), deploy: deployInstructions(doc.client) };
+    if (method === 'GET') return { ...doc.client, counts: Object.fromEntries(CLIENT_COLLECTIONS.map((k) => [k, (doc[k] || []).length])), siteInfo: siteInfo(doc.client), hostingStatus: await hostingStatus(id).catch(() => null) };
     if (method === 'PUT') {
       const allowed = ['name', 'plan', 'status', 'features', 'branding', 'sites', 'pageOverrides', 'hidden', 'recognition'];
       for (const k of allowed) if (k in body) doc.client[k] = typeof body[k] === 'object' && !Array.isArray(body[k]) ? { ...doc.client[k], ...body[k] } : body[k];
@@ -277,6 +310,7 @@ async function clientRoutes({ parts, method, body, session }) {
       Object.assign(p.clients.find((x) => x.id === id), indexEntry(doc.client));
       audit(p, session.userId, 'update client', id);
       await setDoc('platform', p);
+      siteCache.at = 0;
       return doc.client;
     }
     if (method === 'DELETE') {
@@ -284,24 +318,151 @@ async function clientRoutes({ parts, method, body, session }) {
       p.clients = p.clients.filter((x) => x.id !== id);
       audit(p, session.userId, 'delete client', id);
       await setDoc('platform', p);
+      siteCache.at = 0;
+      // Take the client's sites off the VPS too.
+      await removeHosting(id).catch((e) => console.error('remove hosting', id, e));
       return { ok: true };
     }
   }
-  if (sub === 'provision-sites' && method === 'POST') {
-    const r = await provisionNetlifySites(doc.client);
-    if (r.sites) { doc.client.sites = { ...doc.client.sites, ...r.sites }; await saveClient(doc); }
+  if (sub === 'hosting' && method === 'POST') {
+    // (Re)run hosting setup on the VPS for this client's two sites.
+    const r = await provisionHosting(doc.client);
+    doc.client.sites = { ...doc.client.sites, ...r.sites };
+    doc.client.hosting = { provider: 'vps', requestedAt: r.hosting?.requestedAt || now() };
+    await saveClient(doc);
+    Object.assign(p.clients.find((x) => x.id === id), indexEntry(doc.client));
+    audit(p, session.userId, 'set up hosting', id);
+    await setDoc('platform', p);
+    siteCache.at = 0;
     return r;
   }
+  if (sub === 'hosting' && method === 'GET') return (await hostingStatus(id)) || { state: 'none' };
   if (sub === 'users') return userRoutes(doc, method, subId, body, true);
   fail(404, 'Unknown client endpoint');
 }
 
-function deployInstructions(cl) {
-  const api = process.env.URL ? `${process.env.URL}/api` : 'https://fibackend.netlify.app/api';
+// Where a client's two sites live and what they are configured with.
+function siteInfo(cl) {
+  const api = apiBase();
   return {
-    admin: { url: cl.sites.adminUrl, baseDirectory: 'apps/client-admin', env: { FI_API_BASE: api, FI_CLIENT_ID: cl.id } },
-    employee: { url: cl.sites.employeeUrl, baseDirectory: 'apps/client-employee', env: { FI_API_BASE: api, FI_CLIENT_ID: cl.id } },
+    admin: { url: cl.sites.adminUrl, app: 'client-admin', config: { apiBase: api, clientId: cl.id } },
+    employee: { url: cl.sites.employeeUrl, app: 'client-employee', config: { apiBase: api, clientId: cl.id } },
   };
+}
+
+// ---------- releases + site-by-site rollout (/api/platform/releases/...) ----------
+const KINDS = { admin: 'client-admin', employee: 'client-employee' };
+const KIND_NAME = { admin: 'Management', employee: 'Employee' };
+const siteKey = (s) => `${s.clientId}:${s.kind}`;
+
+// Make sure every client site is pinned to a release. Sites without one (older clients, or the first
+// time releases exist) are pinned to the newest release that was already known, so a freshly deployed
+// version never reaches a site until it is rolled out.
+async function syncReleases(p) {
+  const releases = await listReleases();
+  if (!releases.length) return releases;
+  const known = new Set(p.knownReleases || []);
+  const baseline = releases.find((r) => known.has(r.id)) || releases[releases.length - 1];
+  let changed = false;
+  for (const entry of p.clients) {
+    const v = entry.versions || {};
+    if (v.admin && v.employee) continue;
+    const doc = await getDoc(`client/${entry.id}`);
+    if (!doc) continue;
+    doc.client.versions = { admin: v.admin || baseline.id, employee: v.employee || baseline.id };
+    await setDoc(`client/${entry.id}`, doc);
+    entry.versions = doc.client.versions;
+    changed = true;
+  }
+  const ids = releases.map((r) => r.id);
+  if (ids.some((id) => !known.has(id))) {
+    for (const r of releases.filter((x) => !known.has(x.id))) relLog(p, 'system', `Release ${r.id} available`, r.notes || '');
+    p.knownReleases = ids; changed = true;
+  }
+  if (changed) await setDoc('platform', p);
+  return releases;
+}
+function relLog(p, who, action, detail = '') {
+  p.releaseLog = [{ at: now(), who, action, detail }, ...(p.releaseLog || [])].slice(0, 200);
+}
+function allSites(p) {
+  const rank = (c) => (c.plan === 'demo' ? 0 : c.plan === 'beta' ? 1 : 2); // demo first, then beta, then everyone else
+  return [...p.clients].sort((a, b) => rank(a) - rank(b) || String(a.createdAt).localeCompare(String(b.createdAt)))
+    .flatMap((c) => ['admin', 'employee'].map((kind) => ({ clientId: c.id, clientName: c.name, plan: c.plan, status: c.status, kind,
+      url: kind === 'admin' ? c.sites?.adminUrl : c.sites?.employeeUrl, version: c.versions?.[kind] || null })));
+}
+async function setSiteVersion(p, clientId, kind, version) {
+  const doc = await loadClient(clientId);
+  const from = doc.client.versions?.[kind] || null;
+  doc.client.versions = { ...(doc.client.versions || {}), [kind]: version };
+  await saveClient(doc);
+  Object.assign(p.clients.find((x) => x.id === clientId), indexEntry(doc.client));
+  siteCache.at = 0;
+  return { from, url: kind === 'admin' ? doc.client.sites.adminUrl : doc.client.sites.employeeUrl };
+}
+// After switching a site: does it answer, with the new version? 'ok' | 'unreachable' (could not check) | 'failed: …'
+async function checkSite(url, version) {
+  if (!url) return 'unreachable';
+  try {
+    const r = await fetch(`${url.replace(/\/$/, '')}/config.js?check=${Date.now()}`, { signal: AbortSignal.timeout(8000) });
+    if (r.status >= 500) return `failed: HTTP ${r.status}`;
+    const text = await r.text();
+    return text.includes(`"version":"${version}"`) ? 'ok' : 'failed: the site is not serving the new version';
+  } catch { return 'unreachable'; }
+}
+
+async function releaseRoutes(p, { method, body, session, id: action }) {
+  const releases = await syncReleases(p);
+  const who = session.userId;
+  const state = () => ({ backendVersion: VERSION, releases, latest: releases[0]?.id || null, sites: allSites(p), rollout: p.rollout || null, log: (p.releaseLog || []).slice(0, 30) });
+  if (method === 'GET') return state();
+  if (method !== 'POST') fail(405, 'Method not allowed');
+  const ro = p.rollout;
+
+  if (action === 'rollout') {
+    // Plan a rollout of one release to every site that is not on it yet, one site at a time.
+    const target = body.version || releases[0]?.id;
+    if (!releases.some((r) => r.id === target)) fail(400, `Release ${target} is not on the server`);
+    if (ro && ['running', 'paused'].includes(ro.status)) fail(409, `A rollout of ${ro.target} is already in progress. Cancel it first.`);
+    const queue = allSites(p).filter((s) => s.version !== target && s.status !== 'archived').map(({ clientId, kind }) => ({ clientId, kind }));
+    p.rollout = { target, status: queue.length ? 'running' : 'done', startedAt: now(), startedBy: who, queue, done: [] };
+    relLog(p, who, `Rollout of ${target} started`, `${queue.length} site(s), one at a time`);
+  } else if (action === 'next') {
+    // Move the next site in the queue to the target release, check it, and roll it back if the check fails.
+    if (!ro || ro.status !== 'running') fail(409, 'No rollout is running');
+    const site = ro.queue.shift();
+    if (!site) { ro.status = 'done'; relLog(p, who, `Rollout of ${ro.target} finished`); }
+    else {
+      const app = KINDS[site.kind];
+      if (!(await releaseAppDir(ro.target, app))) fail(500, `Release ${ro.target} is missing on the server`);
+      const { from, url } = await setSiteVersion(p, site.clientId, site.kind, ro.target);
+      const check = await checkSite(url, ro.target);
+      const step = { ...site, from, to: ro.target, at: now(), check };
+      if (check.startsWith('failed')) {
+        if (from) await setSiteVersion(p, site.clientId, site.kind, from);
+        step.rolledBack = true; ro.status = 'paused'; ro.queue.unshift(site);
+        relLog(p, who, `${site.clientId} ${KIND_NAME[site.kind]} site: update to ${ro.target} failed, rolled back to ${from}`, check);
+      } else {
+        relLog(p, who, `${site.clientId} ${KIND_NAME[site.kind]} site → ${ro.target}`, check === 'ok' ? 'checked OK' : 'switched (site could not be reached from the backend to double-check)');
+      }
+      ro.done.push(step);
+      if (!ro.queue.length && ro.status === 'running') { ro.status = 'done'; relLog(p, who, `Rollout of ${ro.target} finished`); }
+    }
+  } else if (action === 'pause' || action === 'resume' || action === 'cancel') {
+    if (!ro || !['running', 'paused'].includes(ro.status)) fail(409, 'No rollout in progress');
+    ro.status = { pause: 'paused', resume: 'running', cancel: 'cancelled' }[action];
+    relLog(p, who, `Rollout of ${ro.target} ${ro.status}`, action === 'cancel' ? 'Sites already updated stay on the new release; roll them back individually if needed.' : '');
+  } else if (action === 'site') {
+    // Put one site on a given release (also used to roll a site back).
+    const { clientId, kind, version } = body;
+    if (!KINDS[kind]) fail(400, 'kind must be admin or employee');
+    if (!(await releaseAppDir(version, KINDS[kind]))) fail(400, `Release ${version} is not on the server`);
+    const { from } = await setSiteVersion(p, clientId, kind, version);
+    if (ro?.queue) ro.queue = ro.queue.filter((s) => siteKey(s) !== siteKey({ clientId, kind }));
+    relLog(p, who, `${clientId} ${KIND_NAME[kind]} site: ${from || 'none'} → ${version}`, 'set by hand');
+  } else fail(404, 'Unknown releases action');
+  await setDoc('platform', p);
+  return state();
 }
 
 async function userRoutes(doc, method, id, body, canManage) {

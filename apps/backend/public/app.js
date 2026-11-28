@@ -35,7 +35,8 @@ const NAV = [
   { section: 'Platform' },
   { href: '#/features', label: 'Features', icon: 'shield', id: 'features' },
   { href: '#/admins', label: 'Admin Users', icon: 'key', id: 'admins' },
-  { href: '#/deploy', label: 'Deployment', icon: 'globe', id: 'deploy' },
+  { href: '#/releases', label: 'Releases', icon: 'rocket', id: 'releases' },
+  { href: '#/deploy', label: 'Hosting', icon: 'globe', id: 'deploy' },
 ];
 
 async function render() {
@@ -48,7 +49,7 @@ async function render() {
     chip: 'Platform Admin', user: me, content: '<div class="empty">Loading…</div>' });
   const content = document.getElementById('fi-content');
   try {
-    const views = { '': overview, clients: b ? () => clientDetail(b, c || 'overview') : clients, content: contentPage, catalog: () => catalogPage(b), features: featuresPage, admins: adminsPage, deploy: deployPage };
+    const views = { '': overview, clients: b ? () => clientDetail(b, c || 'overview') : clients, content: contentPage, catalog: () => catalogPage(b), features: featuresPage, admins: adminsPage, deploy: deployPage, releases: releasesPage };
     content.innerHTML = await (views[a] || overview)();
   } catch (e) { content.innerHTML = `<div class="card">${empty('⚠️', e.message)}</div>`; }
 }
@@ -63,7 +64,7 @@ async function overview() {
     ${stat('Clients', o.clients.length, `${o.clients.filter((c) => c.status === 'active').length} active`)}
     ${stat('Users', users, 'across all clients')}
     ${stat('Catalog items', o.catalogs.games + o.catalogs.courses + o.catalogs.rewards, `${o.catalogs.games} games · ${o.catalogs.courses} trainings · ${o.catalogs.rewards} rewards`)}
-    ${stat('Platform admins', o.admins, o.netlifyProvisioning ? 'Netlify auto-provisioning on' : 'Netlify auto-provisioning off')}
+    ${stat('Platform admins', o.admins, o.hosting?.autoProvisioning ? 'VPS auto-hosting on' : 'VPS auto-hosting not installed')}
   </div>
   <div class="fi-grid"><section class="card panel"><div class="card-head"><h2>Clients</h2><a class="linkbtn" href="#/clients">Manage</a></div><div class="card inner table-wrap">${clientTable(o.clients)}</div></section>
   <section class="card"><h3>Recent activity</h3><div class="list mt">${o.audit.map((x) => `<div class="item"><div class="grow"><b>${esc(x.action)}</b> <span class="muted">${esc(x.detail || '')}</span><div class="muted" style="font-size:12px">${timeAgo(x.at)}</div></div></div>`).join('') || empty('🗒️', 'No changes yet')}</div></section></div>`;
@@ -88,16 +89,17 @@ async function clients() {
 
 function provisionModal() {
   const mods = FEATURES.modules.map((m) => toggle(`f_${m.id}`, true, `${m.icon} ${m.name}`)).join('');
-  modal({
+  const m = modal({
     title: 'Provision a new client', submitLabel: 'Create client', wide: true,
-    body: `<div class="form-grid">${field('Company name', input('name', '', 'required placeholder="Acme Corp"'))}${field('Client ID', input('id', '', 'placeholder="acme" pattern="[a-z0-9-]*"'), 'Lowercase, used in URLs and FI_CLIENT_ID. Leave blank to generate.')}</div>
+    body: `<div class="form-grid">${field('Company name', input('name', '', 'required placeholder="Acme Corp"'))}${field('Client ID', input('id', '', 'placeholder="acme" pattern="[a-z0-9-]*"'), 'Lowercase, used in the two site addresses. Leave blank to generate.')}</div>
     <div class="form-grid">${field('Plan', select('plan', ['standard', 'premium', 'beta', 'demo']))}${field('Primary color', input('primaryColor', '#f97316', 'type="color"'))}</div>
     <h3 class="mt mb">First client admin</h3>
     <div class="form-grid">${field('Name', input('adminName', '', 'placeholder="Jane Doe"'))}${field('Email', input('adminEmail', '', 'type="email" required'))}</div>
     ${field('Temporary password', input('adminPassword', '', 'placeholder="Leave blank to generate one"'))}
-    <h3 class="mt mb">Sites</h3>
-    <div class="form-grid">${field('Management site URL', input('adminUrl', '', 'placeholder="https://fi-acme-admin.netlify.app"'))}${field('Employee site URL', input('employeeUrl', '', 'placeholder="https://fi-acme.netlify.app"'))}</div>
-    ${toggle('createNetlifySites', false, 'Create both Netlify sites automatically (needs Netlify settings on the backend site)')}
+    <h3 class="mt mb">Hosting</h3>
+    <p class="ink2 mb">Both sites are hosted on our VPS. With the switch on, they are set up automatically (web address, HTTPS certificate and server config) as soon as you create the client.</p>
+    <div class="card inner mb" data-site-preview>${sitePreview('')}</div>
+    ${toggle('autoHosting', true, 'Set up hosting on the VPS automatically')}
     <h3 class="mt mb">Modules</h3><div class="fi-cols-2">${mods}</div>
     ${toggle('seedDemo', false, 'Fill with sample employees and activity (for demos)')}`,
     onSubmit: async (v) => {
@@ -106,22 +108,39 @@ function provisionModal() {
       showProvisionResult(r);
     },
   });
+  // Show the addresses the new sites will get while the name / id is typed.
+  const f = m.el.querySelector('form');
+  const update = () => { f.querySelector('[data-site-preview]').innerHTML = sitePreview(slug(f.elements.id.value || f.elements.name.value)); };
+  f.elements.id.addEventListener('input', update); f.elements.name.addEventListener('input', update);
 }
+const slug = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40);
+const hostFor = (id, kind) => `${HOSTING.prefix}${id || '&lt;client-id&gt;'}${kind}.${HOSTING.domain}`;
+const sitePreview = (id) => `<div class="list"><div class="item"><span class="grow muted">Management site</span><code>https://${hostFor(esc(id), 'm')}</code></div><div class="item"><span class="grow muted">Employee site</span><code>https://${hostFor(esc(id), 'e')}</code></div></div>`;
+const HOSTING = { prefix: 'us4-site-fun-', domain: 'us4atx.com', server: '162.35.50.245' };
 function showProvisionResult(r) {
   modal({
     title: `🎉 ${esc(r.client.name)} is ready`, hideSubmit: true, cancelLabel: 'Done', wide: true,
     body: `<p>Share these sign-in details with the client admin. The password is shown only once.</p>
     <pre class="mono mt">Email:    ${esc(r.credentials.email)}\nPassword: ${esc(r.credentials.password)}</pre>
-    ${r.netlify?.sites ? `<p class="mt">✅ Netlify sites created: ${siteLink(r.netlify.sites.adminUrl, 'Management')} · ${siteLink(r.netlify.sites.employeeUrl, 'Employee')}</p>` : ''}
-    ${r.netlify?.error ? `<p class="mt" style="color:var(--red)">Netlify: ${esc(r.netlify.error)}</p>` : ''}
-    <h3 class="mt2 mb">Deploy settings</h3>${deployBlock(r.deploy)}`,
+    <h3 class="mt2 mb">Hosting ${hostingPill(r.hosting)}</h3>${r.hosting?.message ? `<p class="ink2 mb">${esc(r.hosting.message)}</p>` : ''}${sitesBlock(r.sites)}`,
   });
   setTimeout(() => { location.hash = `#/clients/${r.client.id}`; }, 0);
 }
-function deployBlock(d) {
+function sitesBlock(d) {
   const one = (label, x) => `<div class="card inner mb"><b>${label}</b> ${x.url ? siteLink(x.url, x.url.replace(/^https?:\/\//, '')) : ''}
-    <pre class="mono mt">Base directory:   ${esc(x.baseDirectory)}\nBuild command:    npm run build\nPublish directory: dist\n\nEnvironment variables:\n${Object.entries(x.env).map(([k, v]) => `  ${k}=${v}`).join('\n')}</pre></div>`;
+    <pre class="mono mt">Site:      ${esc(x.app)}
+Client ID: ${esc(x.config.clientId)}
+API:       ${esc(x.config.apiBase)}</pre></div>`;
   return one('Management site', d.admin) + one('Employee site', d.employee);
+}
+const HOSTING_STATES = {
+  live: ['green', 'Live'], queued: ['yellow', 'Queued'], working: ['yellow', 'Setting up'], waiting_dns: ['yellow', 'Waiting for DNS'],
+  issuing_cert: ['yellow', 'Getting HTTPS certificate'], removing: ['yellow', 'Removing'], removed: ['', 'Removed'],
+  error: ['red', 'Problem'], manual: ['yellow', 'Set up by hand'], none: ['', 'Not set up'],
+};
+function hostingPill(h) {
+  const [color, label] = HOSTING_STATES[h?.state || 'none'] || ['', h.state];
+  return `<span class="pill ${color}">${esc(label)}</span>`;
 }
 
 async function clientDetail(id, tab = 'overview') {
@@ -130,7 +149,8 @@ async function clientDetail(id, tab = 'overview') {
   let body = '';
   if (tab === 'overview') {
     body = `<div class="fi-cols-4 mb">${stat('Users', c.counts.users, 'employees and admins')}${stat('Posts', c.counts.posts, 'recognition and feed')}${stat('Orders', c.counts.orders, 'reward redemptions')}${stat('Assignments', c.counts.assignments, 'training assignments')}</div>
-    <div class="fi-grid"><section class="card"><div class="card-head"><h3>Sites</h3><button class="btn sm" data-act="edit-sites" data-id="${c.id}">Edit URLs</button><button class="btn sm primary" data-act="netlify" data-id="${c.id}">Create on Netlify</button></div>${deployBlock(c.deploy)}</section>
+    <div class="fi-grid"><section class="card"><div class="card-head"><h3>Sites ${hostingPill(c.hostingStatus || (c.hosting ? { state: 'queued' } : null))}</h3><button class="btn sm" data-act="edit-sites" data-id="${c.id}">Edit URLs</button><button class="btn sm primary" data-act="hosting" data-id="${c.id}">${c.hostingStatus?.state === 'live' ? 'Re-check hosting' : 'Set up hosting'}</button></div>
+    ${c.hostingStatus?.message ? `<p class="ink2 mb" style="font-size:13px">${esc(c.hostingStatus.message)}${c.hostingStatus.updatedAt ? ` <span class="muted">(${timeAgo(c.hostingStatus.updatedAt)})</span>` : ''}</p>` : ''}${sitesBlock(c.siteInfo)}</section>
     <section class="card"><h3>Details</h3><div class="list mt"><div class="item"><span class="grow muted">Client ID</span><code>${esc(c.id)}</code></div><div class="item"><span class="grow muted">Plan</span>${esc(c.plan)}</div><div class="item"><span class="grow muted">Status</span><span class="pill ${c.status === 'active' ? 'green' : 'yellow'}">${esc(c.status)}</span></div><div class="item"><span class="grow muted">Created</span>${fmtDate(c.createdAt, { year: 'numeric', month: 'short', day: 'numeric' })}</div></div></section></div>`;
   } else if (tab === 'features') {
     body = `<form class="card" data-form="features" data-id="${c.id}"><p class="ink2 mb">Turn modules and features on or off for this client. Changes apply to both of their sites on the next page load.</p>
@@ -231,16 +251,69 @@ async function adminsPage() {
   <td class="row"><button class="btn sm" data-act="admin-edit" data-id="${a.id}">Edit</button>${a.id !== me.id ? `<button class="btn sm danger" data-act="admin-del" data-id="${a.id}">Remove</button>` : ''}</td></tr>`).join('')}</tbody></table></div></section>`;
 }
 
-// ---------- Deployment ----------
+// ---------- Releases ----------
+const KIND_LABEL = { admin: 'Management', employee: 'Employee' };
+async function releasesPage() {
+  const r = await api('/platform/releases');
+  const ro = r.rollout;
+  const active = ro && ['running', 'paused'].includes(ro.status);
+  const behind = r.sites.filter((s) => s.version !== r.latest).length;
+  const opts = (sel) => r.releases.map((x) => `<option value="${esc(x.id)}" ${x.id === sel ? 'selected' : ''}>${esc(x.id)}</option>`).join('');
+  const rolloutCard = active ? `<section class="card mb"><div class="card-head"><h3>Rolling out ${esc(ro.target)} <span class="pill ${ro.status === 'running' ? 'green' : 'yellow'}">${esc(ro.status)}</span></h3>
+      <div class="row">${ro.status === 'running' ? `<button class="btn primary" data-act="ro-next">Update next site</button><button class="btn" data-act="ro-auto">Update all remaining, one by one</button><button class="btn" data-act="ro-pause">Pause</button>` : `<button class="btn primary" data-act="ro-resume">Resume</button>`}<button class="btn danger" data-act="ro-cancel">Cancel</button></div></div>
+      <p class="ink2">${ro.done.length} done · ${ro.queue.length} to go. Each site is switched, checked, and switched back automatically if the check fails.</p>
+      ${ro.queue[0] ? `<p class="mt">Next: <b>${esc(ro.queue[0].clientId)}</b> · ${KIND_LABEL[ro.queue[0].kind]} site</p>` : ''}</section>`
+    : r.latest ? `<section class="card mb"><div class="card-head"><h3>Latest release: ${esc(r.latest)}</h3>${behind ? `<button class="btn primary" data-act="ro-start" data-version="${esc(r.latest)}">Roll out ${esc(r.latest)} to ${behind} site${behind === 1 ? '' : 's'}</button>` : '<span class="pill green">All sites up to date</span>'}</div>
+      <p class="ink2">${esc(r.releases[0]?.notes || '')}</p></section>`
+    : `<section class="card mb"><p class="ink2">No releases on this server yet. The VPS stores one automatically each time a new version is deployed.</p></section>`;
+  return `${hero({ title: 'Releases', subtitle: `Roll each new version out to the Management and Employee sites one at a time. Backend + API: ${esc(r.backendVersion)}.` })}
+  ${rolloutCard}
+  <div class="fi-grid">
+  <section class="card panel"><h3>Sites</h3><div class="card inner table-wrap mt"><table class="table"><thead><tr><th>Client</th><th>Site</th><th>Release</th><th></th></tr></thead><tbody>
+  ${r.sites.map((s) => `<tr><td><b>${esc(s.clientName)}</b><div class="muted mono" style="background:none;padding:0">${esc(s.clientId)}</div></td><td>${s.url ? siteLink(s.url, KIND_LABEL[s.kind]) : KIND_LABEL[s.kind]}</td>
+    <td><span class="pill ${s.version === r.latest ? 'green' : 'yellow'}">${esc(s.version || 'current')}</span></td>
+    <td>${r.releases.length ? `<select class="sm" data-site-version data-client="${esc(s.clientId)}" data-kind="${s.kind}">${opts(s.version)}</select>` : ''}</td></tr>`).join('')}
+  </tbody></table></div></section>
+  <section class="card"><h3>Release history</h3><div class="list mt">${r.releases.map((x) => `<div class="item"><div class="grow"><b>${esc(x.id)}</b> <span class="muted" style="font-size:12px">${fmtDate(x.createdAt, { year: 'numeric', month: 'short', day: 'numeric' })}${x.sha ? ` · ${esc(x.sha.slice(0, 7))}` : ''}</span><div class="muted" style="font-size:13px">${esc(x.notes || '')}</div></div></div>`).join('') || empty('🚀', 'No releases yet')}</div>
+  <h3 class="mt2">Activity</h3><div class="list mt">${r.log.map((x) => `<div class="item"><div class="grow"><b>${esc(x.action)}</b> <span class="muted">${esc(x.detail || '')}</span><div class="muted" style="font-size:12px">${timeAgo(x.at)}</div></div></div>`).join('') || empty('🗒️', 'Nothing yet')}</div></section></div>`;
+}
+let autoRollout = false;
+async function rolloutAuto() {
+  autoRollout = true; toast('Updating sites one by one. Stay on this page; press Pause to stop.');
+  while (autoRollout) {
+    const r = await api('/platform/releases/next', { method: 'POST' });
+    const last = r.rollout?.done?.[r.rollout.done.length - 1];
+    if (last?.rolledBack) { toast(`${last.clientId} ${KIND_LABEL[last.kind]} site failed its check and was rolled back. Rollout paused.`, true); break; }
+    if (r.rollout?.status !== 'running') break;
+    await rerender(); await new Promise((ok) => setTimeout(ok, 3000));
+  }
+  autoRollout = false; rerender();
+}
+root.addEventListener('change', async (e) => {
+  const sel = e.target.closest('[data-site-version]');
+  if (!sel) return;
+  try { await api('/platform/releases/site', { method: 'POST', body: { clientId: sel.dataset.client, kind: sel.dataset.kind, version: sel.value } }); toast(`${sel.dataset.client} ${KIND_LABEL[sel.dataset.kind]} site now on ${sel.value}`); rerender(); }
+  catch (err) { toast(err.message, true); rerender(); }
+});
+
+// ---------- Hosting ----------
 async function deployPage() {
-  const h = await api('/health');
-  return `${hero({ title: 'Deployment', subtitle: 'How the five Netlify sites fit together.' })}
+  const h = (await api('/health')).hosting || {};
+  const o = await api('/platform/overview');
+  return `${hero({ title: 'Hosting', subtitle: 'Every FunIntended site runs on our own VPS.' })}
   <div class="fi-cols-2">
-  <section class="card"><h3>This backend site</h3><p class="ink2 mt">Hosts this panel and the central API at <code>/api</code>. Data is stored in Supabase (table <code>fi_documents</code>).</p>
-  <pre class="mono mt">Base directory: apps/backend\n\nEnvironment variables:\n  SUPABASE_URL=https://&lt;project&gt;.supabase.co (required)\n  SUPABASE_SERVICE_ROLE_KEY=&lt;service_role key&gt; (required)\n  FI_SECRET=&lt;long random string&gt;      (required)\n  FI_ADMIN_EMAIL=you@yourcompany.com  (first admin)\n  FI_ADMIN_PASSWORD=&lt;strong password&gt; (first admin)\n\nOptional, for one-click client sites:\n  NETLIFY_AUTH_TOKEN, NETLIFY_ACCOUNT_SLUG,\n  FI_GITHUB_REPO, FI_GITHUB_INSTALLATION_ID</pre>
-  <p class="mt">Netlify auto-provisioning: ${h.netlifyProvisioning ? '<span class="pill green">configured</span>' : '<span class="pill yellow">not configured</span>'}</p></section>
-  <section class="card"><h3>Client sites</h3><p class="ink2 mt">Every client has two sites built from the same code. They differ only by <code>FI_CLIENT_ID</code>.</p>
-  <div class="list mt">${[['Demo · Management', 'fidemoadmin.netlify.app', 'apps/client-admin', 'demo'], ['Demo · Employee', 'fidemoemployee.netlify.app', 'apps/client-employee', 'demo'], ['Beta 1 · Management', 'fibetaadmin1.netlify.app', 'apps/client-admin', 'beta1'], ['Beta 1 · Employee', 'fiemployeebeta1.netlify.app', 'apps/client-employee', 'beta1']].map(([l, u, b, id]) => `<div class="item"><div class="grow"><b>${l}</b><div class="muted" style="font-size:13px">${u}</div></div><code>${b}</code><code>FI_CLIENT_ID=${id}</code></div>`).join('')}</div></section></div>`;
+  <section class="card"><h3>The server</h3><div class="list mt">
+    <div class="item"><span class="grow muted">Server</span><code>Ubuntu VPS · ${esc(h.server || HOSTING.server)}</code></div>
+    <div class="item"><span class="grow muted">Backend + API</span><code>https://${esc(h.backendHost || 'us4-app-funbackend.us4atx.com')}/api</code></div>
+    <div class="item"><span class="grow muted">Database</span><code>Self-hosted Supabase (fi_documents)</code></div>
+    <div class="item"><span class="grow muted">Web server / HTTPS</span><code>OpenPanel (Caddy, Let's Encrypt)</code></div>
+    <div class="item"><span class="grow muted">Client site addresses</span><code>${esc(h.siteHostPattern || `${HOSTING.prefix}<client-id>m / e.${HOSTING.domain}`)}</code></div>
+    <div class="item"><span class="grow muted">Automatic hosting for new clients</span>${h.autoProvisioning ? '<span class="pill green">on</span>' : '<span class="pill yellow">agent not installed</span>'}</div>
+  </div>
+  <p class="ink2 mt" style="font-size:13px">When a client is created, the backend asks the provisioning agent on the VPS to add its two sites. The agent checks the address points at the server, adds it to the web server, gets the HTTPS certificate and reports back here.
+  The server itself (and its DNS records) is tracked in US4 Site Admin → Infrastructure.</p></section>
+  <section class="card"><h3>Client sites</h3><p class="ink2 mt">Every client has two sites built from the same code. They differ only by client ID.</p>
+  <div class="list mt">${o.clients.map((c) => `<div class="item"><div class="grow"><b>${esc(c.name)}</b><div class="muted" style="font-size:13px">${siteLink(c.sites?.adminUrl, 'Management')} · ${siteLink(c.sites?.employeeUrl, 'Employee')}</div></div><code>${esc(c.id)}</code></div>`).join('') || empty('🏢', 'No clients yet')}</div></section></div>`;
 }
 
 // ---------- actions ----------
@@ -251,11 +324,15 @@ root.addEventListener('click', async (e) => {
   const { act, id, kind } = el.dataset;
   try {
     if (act === 'new-client') return provisionModal();
+    if (act === 'ro-start') { await api('/platform/releases/rollout', { method: 'POST', body: { version: el.dataset.version } }); toast('Rollout planned. Update the sites one at a time.'); return rerender(); }
+    if (act === 'ro-next') { el.disabled = true; const r = await api('/platform/releases/next', { method: 'POST' }); const last = r.rollout?.done?.at(-1); toast(last?.rolledBack ? `Check failed: ${last.check}. Rolled back and paused.` : `${last?.clientId} ${KIND_LABEL[last?.kind] || ''} site updated`, !!last?.rolledBack); return rerender(); }
+    if (act === 'ro-auto') return rolloutAuto();
+    if (['ro-pause', 'ro-resume', 'ro-cancel'].includes(act)) { autoRollout = false; await api(`/platform/releases/${act.slice(3)}`, { method: 'POST' }); return rerender(); }
     if (act === 'edit-sites') {
       const c = await api(`/clients/${id}`);
       return modal({ title: 'Site URLs', body: field('Management site URL', input('adminUrl', c.sites.adminUrl)) + field('Employee site URL', input('employeeUrl', c.sites.employeeUrl)), onSubmit: async (v) => { await api(`/clients/${id}`, { method: 'PUT', body: { sites: v } }); toast('Saved'); rerender(); } });
     }
-    if (act === 'netlify') { el.disabled = true; const r = await api(`/clients/${id}/provision-sites`, { method: 'POST' }); toast(r.manual ? r.message : 'Netlify sites created'); return rerender(); }
+    if (act === 'hosting') { el.disabled = true; const r = await api(`/clients/${id}/hosting`, { method: 'POST' }); toast(r.hosting?.message || 'Hosting requested', r.hosting?.state === 'error'); return rerender(); }
     if (act === 'add-user') return modal({ title: 'Add user', wide: true, body: userForm(), onSubmit: async (v) => { const r = await api(`/clients/${id}/users`, { method: 'POST', body: v }); modal({ title: 'User added', hideSubmit: true, cancelLabel: 'Done', body: `<p>Share these sign-in details:</p><pre class="mono mt">Email:    ${esc(r.user.email)}\nPassword: ${esc(r.password)}</pre>` }); rerender(); } });
     if (act === 'edit-user') {
       const users = await api(`/clients/${id}/users`); const u = users.find((x) => x.id === el.dataset.user);

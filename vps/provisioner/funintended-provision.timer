@@ -1,0 +1,9 @@
+[Unit]
+Description=FunIntended: retry hosting requests waiting on DNS or HTTPS
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

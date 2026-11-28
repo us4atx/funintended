@@ -9,7 +9,7 @@ const root = document.getElementById('root');
 let site = null, D = null, catalog = null;
 
 async function boot() {
-  if (!CFG.clientId) { root.innerHTML = `<div class="fi-login"><div class="card"><h1>Not set up yet</h1><p class="sub">Set FI_CLIENT_ID on this Netlify site, or add ?client=demo to the URL.</p></div></div>`; return; }
+  if (!CFG.clientId) { root.innerHTML = `<div class="fi-login"><div class="card"><h1>Not set up yet</h1><p class="sub">Open it from the client's own site address, or add ?client=demo to the URL.</p></div></div>`; return; }
   try { site = await api(`/site/${CFG.clientId}`); }
   catch (e) { root.innerHTML = `<div class="fi-login"><div class="card"><h1>Site unavailable</h1><p class="sub">${esc(e.message)}</p></div></div>`; return; }
   document.title = `${site.branding.companyName || site.name} · FunIntended Management`;

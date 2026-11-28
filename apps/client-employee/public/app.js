@@ -10,7 +10,7 @@ let D = null; // bootstrap data for the signed-in employee
 
 // ---------- boot ----------
 async function boot() {
-  if (!CFG.clientId) { root.innerHTML = `<div class="fi-login"><div class="card"><h1>Not set up yet</h1><p class="sub">This site has no client assigned. Set FI_CLIENT_ID on the Netlify site, or add ?client=demo to the URL.</p></div></div>`; return; }
+  if (!CFG.clientId) { root.innerHTML = `<div class="fi-login"><div class="card"><h1>Not set up yet</h1><p class="sub">This site has no client assigned. Open it from the client's own site address, or add ?client=demo to the URL.</p></div></div>`; return; }
   try { site = await api(`/site/${CFG.clientId}`); }
   catch (e) { root.innerHTML = `<div class="fi-login"><div class="card"><h1>Site unavailable</h1><p class="sub">${esc(e.message)}</p></div></div>`; return; }
   document.title = `${site.branding.companyName || site.name} · FunIntended`;

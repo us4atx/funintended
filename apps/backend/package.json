@@ -2,6 +2,5 @@
   "name": "funintended-backend",
   "private": true,
   "type": "module",
-  "scripts": { "build": "node ../../scripts/build.mjs backend" },
-  "dependencies": { "@netlify/blobs": "^8.1.0" }
+  "scripts": { "build": "node ../../scripts/build.mjs backend" }
 }

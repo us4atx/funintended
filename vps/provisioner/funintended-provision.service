@@ -1,0 +1,8 @@
+[Unit]
+Description=FunIntended: set up hosting for new clients (Caddy site blocks + HTTPS)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env node /opt/funintended-provision/fi-provision.mjs
+TimeoutStartSec=300

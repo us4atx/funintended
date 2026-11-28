@@ -4,7 +4,7 @@
 -- The backend stores each record set as one JSON document:
 --   key = 'platform'        platform admins, features, page content, catalogs, client list
 --   key = 'client/<id>'     one client's settings, users, posts, orders, trainings, mentorships...
--- Only the backend (Netlify Function, using the service role key) reads or writes this table.
+-- Only the backend (FunIntended server on the VPS, using the service role key) reads or writes this table.
 
 create table if not exists public.fi_documents (
   key        text primary key,
